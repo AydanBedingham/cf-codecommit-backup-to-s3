@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Automated backup of CodeCommit Repositories to S3 Bucket"
+
+# Based on "AWS Prescriptive Guidance Patterns: Automate event-driven backups from CodeCommit to Amazon S3 using CodeBuild and CloudWatch Events"
+# https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/automate-event-driven-backups-from-codecommit-to-amazon-s3-using-codebuild-and-cloudwatch-events.html
+
+Parameters:
+  BranchesToMonitor:
+    Description: "List of Repository Branches to monitor (Comma-Delimited). Empty = All branches"
+    Type: CommaDelimitedList
+    Default: "develop,master,main"
+
+  BackupRetentionPeriod:
+    Description: "Number of days to retain backups. 0 = Retain forever"
+    Type: Number
+    MinValue: 0
+    Default: 10
+
+  BackupBucketName:
+    Description: "Name of the S3 Bucket that will be created to store CodeCommit Repository backups"
+    Type: String
+    AllowedPattern : '^[a-z0-9][a-z0-9//.//-]*[a-z0-9]$'
+    MinLength: 3
+    MaxLength: 3600
+    Default: repository-backups
+
+  EventBusName:
+    Description: "Name of the existing EventBus for Rule used to trigger backups"
+    Type: String
+    AllowedPattern : ".+"
+    Default: "default"
+
+Conditions:
+  EnableExpirationRule: !Not [!Equals [!Ref BackupRetentionPeriod, 0]]
+  MonitorSpecificBranches: !Not [!Equals [ !Join ["", !Ref BranchesToMonitor], ""]]
+
+Resources:
+
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BackupBucketName
+      AccessControl: LogDeliveryWrite
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        RestrictPublicBuckets: true
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: "LifecyclePolicy"
+            Status: !If [EnableExpirationRule, "Enabled", "Disabled"]
+            ExpirationInDays: !If [EnableExpirationRule, !Ref BackupRetentionPeriod, 1]
+
+  BackupCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub automated-repository-backup-to-s3
+      ServiceRole: !GetAtt BackupCodeBuildServiceRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+        - Name: "BACKUP_BUCKET_NAME"
+          Type: PLAINTEXT
+          Value: !Ref BackupBucket
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - pip install git-remote-codecommit
+            build:
+              commands:
+                - env
+                - git clone -b $REFERENCE_NAME codecommit::$REPO_REGION://$REPOSITORY_NAME
+                - dt=$(date '+%Y-%m-%d-%H-%M-%S');
+                - echo "$dt"
+                - zip_filename=${COMMIT_ID}_${dt}.zip
+                - zip -yr $zip_filename ./
+                - aws s3 cp $zip_filename s3://$BACKUP_BUCKET_NAME/$REPOSITORY_NAME/$REFERENCE_NAME/
+
+  BackupTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Automatic backup of CodeCommit Repositories to S3"
+      EventBusName: !Ref EventBusName
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - "CodeCommit Repository State Change"
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName: !If [MonitorSpecificBranches, !Ref BranchesToMonitor, !Ref AWS::NoValue]
+      Targets:
+        - Arn: !GetAtt BackupCodeBuildProject.Arn
+          Id: "BackupCodeBuildProject"
+          RoleArn: !GetAtt BackupTriggerRuleRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              account: "$.account"
+              commitId: "$.detail.commitId"
+              referenceName: "$.detail.referenceName"
+              referenceType: "$.detail.referenceType"
+              region: "$.region"
+              repositoryName: "$.detail.repositoryName"
+            InputTemplate: >-
+              {
+                "environmentVariablesOverride": [
+                    {
+                        "name": "REFERENCE_NAME",
+                        "value": <referenceName>
+                    },
+                    {
+                        "name": "REFERENCE_TYPE",
+                        "value": <referenceType>
+                    },
+                    {
+                        "name": "REPOSITORY_NAME",
+                        "value": <repositoryName>
+                    },
+                    {
+                        "name": "COMMIT_ID",
+                        "value": <commitId>
+                    },
+                    {
+                        "name": "REPO_REGION",
+                        "value": <region>
+                    },
+                    {
+                        "name": "ACCOUNT_ID",
+                        "value": <account>
+                    }
+              ]}
+
+  BackupTriggerRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: PutEventsDestinationBus
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt BackupCodeBuildProject.Arn
+
+  BackupCodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: "CodeBuildAccessPolicy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Effect: Allow
+                Resource: "*"
+              - Action:
+                - codecommit:GitPull
+                Effect: Allow
+                Resource: "*"
+              - Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+                - s3:PutObject
+                Effect: Allow
+                Resource: !Sub "arn:aws:s3:::${BackupBucket}/*"
+              - Action:
+                - s3:GetBucketAcl
+                - s3:GetBucketLocation
+                Effect: Allow
+                Resource: "*"
+
+Outputs:
+  BackupBucketName:
+    Description: "S3 Bucket used to store repository backups"
+    Value: !Ref BackupBucket
